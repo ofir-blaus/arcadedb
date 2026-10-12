@@ -11433,6 +11433,16 @@ public class LSMVectorIndex implements Index, IndexInternal {
 
       // Parse variable-sized entries sequentially (no pointer table)
       int currentOffset = headerSize;
+      // What the page changes for search (issue #9857). put() and remove() make a local write visible by queueing
+      // a delta entry, counting a mutation and promoting graphState, and a replica that applies the same write as a
+      // page must do the same: without it a graph built by an earlier search here never sees the vector, and since
+      // graphState stays IMMUTABLE rebuildGraphBeforeSearch() never fires - not on this node, and not after it is
+      // promoted to leader. A page carries every entry it holds, not just the new ones, so only an id this index has
+      // never seen is new, and only a tombstone it did not already have is a removal, so a re-applied page changes
+      // neither. Compacted pages are left out altogether: a compaction adds and removes no vector, and since the
+      // renumbering compaction of issue #5870 its ids are not the ids the graph was built from.
+      List<DeltaVectorEntry> replicatedInserts = null;
+      int replicatedRemovals = 0;
       for (int i = 0; i < numberOfEntries; i++) {
         // Record absolute file offset for this entry
         final long entryFileOffset = pageStartOffset + BasePage.PAGE_HEADER_SIZE + currentOffset;
@@ -11486,9 +11496,34 @@ public class LSMVectorIndex implements Index, IndexInternal {
         if (id >= nextId.get())
           nextId.accumulateAndGet(id + 1, Math::max);
 
+        final boolean known = isCompacted || vectorIndex().isLive(id) || vectorIndex().isDeleted(id);
+        final boolean wasDeleted = known && vectorIndex().isDeleted(id);
+
         // Update VectorLocationIndex with this entry's absolute file offset
         // LSM semantics: later entries override earlier ones
         vectorIndex().addOrUpdate(id, isCompacted, entryFileOffset, rid, deleted);
+
+        if (!deleted && !known) {
+          if (replicatedInserts == null)
+            replicatedInserts = new ArrayList<>();
+          // No payload: the vector is on the page just written, and deltaVectorOf() reads it from there when scored.
+          replicatedInserts.add(new DeltaVectorEntry(id, rid, null));
+        } else if (deleted && !wasDeleted && !isCompacted)
+          replicatedRemovals++;
+      }
+
+      if (replicatedInserts != null || replicatedRemovals > 0) {
+        lock.writeLock().lock();
+        try {
+          if (replicatedInserts != null)
+            for (final DeltaVectorEntry entry : replicatedInserts)
+              queueDeltaEntry(entry);
+          mutationsSinceSerialize.addAndGet((replicatedInserts != null ? replicatedInserts.size() : 0) + replicatedRemovals);
+          if (graphState == GraphState.IMMUTABLE || graphState == GraphState.LOADING)
+            this.graphState = GraphState.MUTABLE;
+        } finally {
+          lock.writeLock().unlock();
+        }
       }
 
       LogManager.instance()
